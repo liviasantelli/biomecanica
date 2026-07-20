@@ -1,0 +1,11 @@
+# Modelo baixado (obtido via download_model.py)
+models/*.task
+
+# Resultados de sessoes
+resultados/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
