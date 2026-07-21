@@ -77,11 +77,37 @@ class FilterConfig:
 
 @dataclass
 class QualityConfig:
-    """Limiares para classificar a qualidade do frame e orientar o usuario."""
-    min_face_width_fraction: float = 0.15   # face_width_px / diagonal_imagem
-    max_face_width_fraction: float = 0.9
-    max_roll_deg: float = 30.0              # inclinacao maxima da cabeca (roll)
-    max_global_jump_fraction: float = 0.25  # deslocamento do nasion entre frames (fracao da largura facial)
+    """
+    Limiares para classificar a qualidade do frame e orientar o usuario.
+
+    IMPORTANTE: as razoes de tamanho facial sao normalizadas pela LARGURA do
+    frame (face_width_px / frame_width_px), nao pela diagonal. A distancia
+    interocular e uma medida essencialmente horizontal; normalizar pela
+    diagonal faz o limiar variar com a proporcao da imagem (16:9 vs 4:3) sem
+    motivo e, na pratica, exige que o rosto fique perto demais da camera
+    (bug observado: 0.15*diagonal em 1280x720 exigia ~220px de distancia
+    interocular, so atingivel a menos de ~30cm - por isso toda a sessao era
+    marcada como invalida mesmo com o rosto claramente visivel no video).
+
+    Como a razao e uma fracao da largura do frame, os mesmos valores
+    funcionam em qualquer resolucao (640x480, 1280x720, etc.).
+    """
+
+    min_face_width_ratio: float = 0.06
+    # face_width_px / frame_width_px minimo aceitavel. 0.06 corresponde a um
+    # rosto a webcam a ~90-100cm de distancia (uso tipico de mesa); abaixo
+    # disso ha poucos pixels entre os labios para medir a abertura com
+    # confianca. Deliberadamente permissivo: uma face "um pouco distante"
+    # mas ainda claramente utilizavel nao deve ser marcada invalida.
+    max_face_width_ratio: float = 0.65
+    # face_width_px / frame_width_px maximo aceitavel. 0.65 so e excedido com
+    # o rosto extremamente proximo da camera (poucos cm), quando pequenos
+    # movimentos ja tendem a levar os landmarks para fora da imagem.
+    max_roll_deg: float = 30.0
+    # inclinacao maxima da cabeca no plano da imagem (roll), em graus.
+    max_global_jump_fraction: float = 0.25
+    # deslocamento do nasion entre frames consecutivos, como fracao da
+    # largura facial atual; acima disso considera-se movimento brusco.
 
 
 @dataclass

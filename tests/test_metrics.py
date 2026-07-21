@@ -237,7 +237,10 @@ def test_recorder_csv_roundtrip():
 def _run_calibration(closed_v: float, open_v: float) -> object:
     ca = CalibrationAssistant()
     ca.start()
-    t = 0.0
+    # ca.start() ancora phase_start em time.perf_counter() (tempo real do
+    # sistema); "now" precisa ser ancorado no MESMO referencial, senao
+    # elapsed = now - phase_start fica sempre negativo e a fase nunca avanca.
+    t = ca.phase_start
     result = None
     # Alimenta o valor conforme a fase atual do assistente (0=fechado, 1=aberto).
     # O proprio assistente avanca a fase quando o tempo de espera se esgota.

@@ -132,6 +132,62 @@ def test_quality_global_jump_between_frames():
 
 
 # --------------------------------------------------------------------------
+# Razao de tamanho facial normalizada pela LARGURA do frame (nao a diagonal)
+# --------------------------------------------------------------------------
+def make_face_with_ratio(frame_w: int, frame_h: int, ratio: float,
+                          opening_px: float = 50.0, lateral_px: float = 0.0) -> FaceLandmarks:
+    """Constroi um rosto sintetico centralizado com face_width_px/frame_w == ratio."""
+    face_width = ratio * frame_w
+    cx, cy = frame_w / 2.0, frame_h / 2.0
+    pts = np.zeros((N_LANDMARKS, 2), dtype=np.float32)
+    pts[Landmark.EYE_OUTER_LEFT] = (cx - face_width / 2.0, cy - face_width / 4.0)
+    pts[Landmark.EYE_OUTER_RIGHT] = (cx + face_width / 2.0, cy - face_width / 4.0)
+    pts[Landmark.NASION] = (cx, cy - face_width / 4.0 + face_width * 0.05)
+    pts[Landmark.CHIN] = (cx + lateral_px, cy + face_width / 2.0)
+    pts[Landmark.UPPER_LIP_INNER] = (cx, cy + face_width * 0.25)
+    pts[Landmark.LOWER_LIP_INNER] = (cx, cy + face_width * 0.25 + opening_px)
+    return FaceLandmarks(points=pts, image_width=frame_w, image_height=frame_h)
+
+
+def test_face_ratio_normalized_640x480():
+    face = make_face_with_ratio(640, 480, ratio=0.10)
+    result = assess_quality(face, None, QualityConfig())
+    assert result.ratio is not None
+    assert abs(result.ratio - 0.10) < 1e-3
+    assert result.quality == FrameQuality.VALIDA
+
+
+def test_face_ratio_normalized_1280x720():
+    face = make_face_with_ratio(1280, 720, ratio=0.10)
+    result = assess_quality(face, None, QualityConfig())
+    assert result.ratio is not None
+    assert abs(result.ratio - 0.10) < 1e-3
+    assert result.quality == FrameQuality.VALIDA
+
+
+def test_face_ratio_invariant_across_resolutions():
+    """A mesma proporcao real do rosto perante a camera deve dar a mesma
+    razao e a mesma classificacao de qualidade, em qualquer resolucao."""
+    r_640 = assess_quality(make_face_with_ratio(640, 480, ratio=0.10), None, QualityConfig())
+    r_1280 = assess_quality(make_face_with_ratio(1280, 720, ratio=0.10), None, QualityConfig())
+    assert abs(r_640.ratio - r_1280.ratio) < 1e-6
+    assert r_640.quality == r_1280.quality == FrameQuality.VALIDA
+
+
+def test_regression_realistic_webcam_distance_is_no_longer_invalid():
+    """
+    Reproduz o bug relatado: um rosto a distancia tipica de uso de webcam em
+    1280x720 (razao ~0.09, equivalente a ~60cm da camera) NAO pode mais ser
+    marcado invalido so por estar "um pouco distante". O limiar antigo
+    (0.15 * diagonal da imagem) exigia ~17% da largura do frame, so
+    atingivel a menos de ~30cm - por isso a sessao inteira era invalidada.
+    """
+    face = make_face_with_ratio(1280, 720, ratio=0.09)
+    result = assess_quality(face, None, QualityConfig())
+    assert result.quality == FrameQuality.VALIDA, result.message
+
+
+# --------------------------------------------------------------------------
 # Comparacao entre sessoes: validacao de colunas
 # --------------------------------------------------------------------------
 def _write_csv(path: str, columns: list, n_rows: int = 5) -> None:

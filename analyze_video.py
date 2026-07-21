@@ -1,9 +1,9 @@
 """
 Analise offline de um video gravado (sem webcam ao vivo).
 
-Reusa o mesmo pipeline de metricas do modo ao vivo (deteccao, filtragem EMA,
-controle de qualidade, deteccao de ciclos) para processar cada frame de um
-arquivo de video e gerar a mesma pasta de sessao do modo ao vivo:
+Reusa o mesmo pipeline de metricas do modo ao vivo (mandibular.pipeline.process_frame:
+deteccao, controle de qualidade, filtragem EMA) para processar cada frame de
+um arquivo de video e gerar a mesma pasta de sessao do modo ao vivo:
     - dados.csv, resumo.json, metadados.json;
     - abertura_tempo.png, lateralidade_tempo.png, trajetoria_*.png;
     - video anotado (opcional, --save-video).
@@ -32,9 +32,9 @@ from mandibular.config import AppConfig, Landmark  # noqa: E402
 from mandibular.exporter import export_session, make_session_id  # noqa: E402
 from mandibular.filters import EMAFilter  # noqa: E402
 from mandibular.landmarks import FaceMeshDetector  # noqa: E402
-from mandibular.metrics import CycleDetector, compute_frame_metrics, lateral_direction  # noqa: E402
+from mandibular.metrics import CycleDetector  # noqa: E402
 from mandibular.overlay import draw_landmarks, draw_opening_bar, draw_panel  # noqa: E402
-from mandibular.quality import FrameQuality, assess_quality  # noqa: E402
+from mandibular.pipeline import process_frame  # noqa: E402
 from mandibular.recorder import Sample, SessionRecorder  # noqa: E402
 from mandibular.video_recorder import VideoRecorder  # noqa: E402
 
@@ -69,13 +69,18 @@ def analyze(
 
     filt_opening = EMAFilter(cfg.filter.alpha_opening)
     filt_lateral = EMAFilter(cfg.filter.alpha_lateral)
+    filt_face_width = EMAFilter(cfg.filter.alpha_face_width)
 
-    # 1a passada: calcula as metricas brutas de cada frame (para calibrar
-    # automaticamente pela faixa observada, se pedido).
-    raw_metrics: list[tuple[int, float, object, object]] = []  # (idx, t, face_or_None, metrics_or_None)
-    openings_rel: list[float] = []
+    # Unica passada de deteccao/filtragem: cada frame gera um FrameResult
+    # (metricas, qualidade, valor filtrado ou None se invalido). So os
+    # frames VALIDOS entram na amostra usada para a calibracao automatica
+    # (percentis) - um rosto longe demais/inclinado nao pode influenciar os
+    # limiares de "fechado"/"aberto".
+    frame_results: list[tuple[int, float, object, object]] = []  # (idx, t, face, FrameResult)
+    valid_openings_rel: list[float] = []
     idx = 0
     faces_ok = 0
+    prev_nasion = None
     last_pct = -1
     while True:
         ok, frame = cap.read()
@@ -84,11 +89,20 @@ def analyze(
         t = idx / fps
         ts_ms = int(t * 1000)
         face = detector.process(frame, ts_ms)
-        m = compute_frame_metrics(face, ref_mm) if face is not None else None
+
+        fr = process_frame(
+            face, ref_mm, mirrored, cfg.quality,
+            filt_opening, filt_lateral, filt_face_width,
+            prev_nasion=prev_nasion,
+        )
+        prev_nasion = face.point(Landmark.NASION) if face is not None else None
+
         if face is not None:
             faces_ok += 1
-            openings_rel.append(m.opening_rel)
-        raw_metrics.append((idx, t, face, m))
+        if fr.frame_valid and fr.metrics is not None:
+            valid_openings_rel.append(fr.metrics.opening_rel)
+
+        frame_results.append((idx, t, face, fr))
         idx += 1
 
         if n_frames > 0:
@@ -98,21 +112,25 @@ def analyze(
                 last_pct = pct
     cap.release()
 
-    if not raw_metrics or faces_ok == 0:
+    if not frame_results or faces_ok == 0:
         detector.close()
         print("Nenhuma face detectada no video.")
         return
 
     print(f"Faces detectadas em {faces_ok}/{idx} frames "
-          f"({100 * faces_ok / max(idx, 1):.0f}%).")
+          f"({100 * faces_ok / max(idx, 1):.0f}%).  "
+          f"Frames validos para calibracao: {len(valid_openings_rel)}.")
 
     cycles = CycleDetector(cfg.cycle)
-    if calib_auto:
-        arr = np.array(openings_rel)
+    if calib_auto and valid_openings_rel:
+        arr = np.array(valid_openings_rel)
         closed = float(np.percentile(arr, 5))
         opened = float(np.percentile(arr, 95))
         cycles.calibrate(closed, opened)
         print(f"Calibracao automatica: fechado~{closed:.3f}  aberto~{opened:.3f} (rel)")
+    elif calib_auto:
+        print("Calibracao automatica pulada: nenhum frame valido no video "
+              "(veja aviso_qualidade no CSV/resumo para o motivo).")
 
     session_id = make_session_id()
     base = os.path.splitext(os.path.basename(path))[0]
@@ -125,35 +143,23 @@ def analyze(
             os.path.join(session_dir, "video.mp4"), fps, (frame_w, frame_h)
         )
 
-    # Reabre o video para a 2a passada (desenho/gravacao), pois o VideoCapture
-    # ja foi liberado apos a 1a passada.
+    # Reabre o video para desenhar/gravar (o VideoCapture original ja foi
+    # liberado); a deteccao e as metricas NAO sao recalculadas aqui, apenas
+    # reusadas de frame_results.
     cap2 = cv2.VideoCapture(path) if save_video else None
 
     recorder = SessionRecorder()
-    prev_nasion = None
-    for frame_idx, t, face, m in raw_metrics:
+    for frame_idx, t, face, fr in frame_results:
         frame_for_video = None
         if cap2 is not None:
             ok, frame_for_video = cap2.read()
             if not ok:
                 frame_for_video = None
 
-        quality = assess_quality(face, prev_nasion, cfg.quality)
-        prev_nasion = face.point(Landmark.NASION) if face is not None else None
-        frame_valid = quality.quality == FrameQuality.VALIDA
+        if fr.frame_valid:
+            cycles.update(fr.opening_filtered, t)
 
-        if frame_valid and m is not None:
-            opening_filt = filt_opening.update(m.opening_rel)
-            lateral_filt = filt_lateral.update(m.lateral_rel)
-        else:
-            opening_filt = filt_opening.value or 0.0
-            lateral_filt = filt_lateral.value or 0.0
-
-        direction = lateral_direction(lateral_filt, mirrored) if frame_valid else "centro"
-
-        if frame_valid:
-            cycles.update(opening_filt, t)
-
+        m = fr.metrics
         recorder.add(
             Sample(
                 session_id=f"{base}_{session_id}",
@@ -161,32 +167,34 @@ def analyze(
                 timestamp=f"{t:.3f}s",
                 time_s=t,
                 face_detected=face is not None,
-                frame_valid=frame_valid,
-                opening_raw=m.opening_px if m is not None else 0.0,
-                opening_rel=m.opening_rel if m is not None else 0.0,
-                opening_filtered=opening_filt,
-                opening_mm=(m.opening_mm if (m is not None and frame_valid) else None),
-                lateral_raw=m.lateral_px if m is not None else 0.0,
-                lateral_rel=m.lateral_rel if m is not None else 0.0,
-                lateral_filtered=lateral_filt,
-                lateral_mm=(m.lateral_mm if (m is not None and frame_valid) else None),
-                direction=direction,
+                frame_valid=fr.frame_valid,
+                opening_raw=(m.opening_px if m is not None else None),
+                opening_rel=(m.opening_rel if m is not None else None),
+                opening_filtered=fr.opening_filtered,
+                opening_mm=(m.opening_mm if (m is not None and fr.frame_valid) else None),
+                lateral_raw=(m.lateral_px if m is not None else None),
+                lateral_rel=(m.lateral_rel if m is not None else None),
+                lateral_filtered=fr.lateral_filtered,
+                lateral_mm=(m.lateral_mm if (m is not None and fr.frame_valid) else None),
+                direction=fr.direction,
                 cycle_state=cycles.state,
                 repetitions=cycles.repetitions,
-                quality_warning=quality.message,
+                quality_warning=fr.quality.message,
             )
         )
 
         if video_writer is not None and frame_for_video is not None:
             if face is not None:
                 draw_landmarks(frame_for_video, face)
-                draw_opening_bar(frame_for_video, opening_filt, cycles)
-            lines = [(f"Abertura: {opening_filt:.3f} rel", (255, 255, 255))]
-            lines.append((f"Desvio: {lateral_filt:+.3f} [{direction}]", (255, 255, 255)))
+                draw_opening_bar(frame_for_video, fr.opening_display, cycles)
+            lines = [(f"Abertura: {fr.opening_display:.3f} rel", (255, 255, 255))]
+            lines.append((f"Desvio: {fr.lateral_display:+.3f} [{fr.direction}]", (255, 255, 255)))
             lines.append((f"Estado: {cycles.state.value.upper()}", (0, 220, 0)))
             lines.append((f"Repeticoes: {cycles.repetitions}", (255, 255, 255)))
-            if quality.message:
-                lines.append((quality.message, (0, 180, 255)))
+            if not fr.frame_valid:
+                lines.append(("Frame invalido - ultimo valor valido exibido", (0, 180, 255)))
+            if fr.quality.message:
+                lines.append((fr.quality.message, (0, 180, 255)))
             draw_panel(frame_for_video, lines)
             video_writer.write(frame_for_video)
 
@@ -214,16 +222,23 @@ def analyze(
 
 def _print_summary(recorder, cycles, ref_mm) -> None:
     valid_samples = [s for s in recorder.samples if s.frame_valid]
+    total = len(recorder.samples)
+    pct = (100.0 * len(valid_samples) / total) if total else 0.0
+
+    print("\n" + "=" * 52)
+    print("RESUMO DA ANALISE")
+    print("=" * 52)
+    print(f"Frames totais: {total}  |  Frames validos: {len(valid_samples)} ({pct:.0f}%)")
+    if not cycles.is_calibrated:
+        print("AVISO: sessao NAO calibrada (repeticoes, se houver, usam faixa dinamica).")
+
     if not valid_samples:
-        print("\nNenhum frame valido para calcular o resumo.")
+        print("Nenhum frame valido para calcular metricas de abertura/desvio.")
         return
 
     openings_rel = np.array([s.opening_rel for s in valid_samples])
     lateral_rel = np.array([s.lateral_rel for s in valid_samples])
 
-    print("\n" + "=" * 52)
-    print("RESUMO DA ANALISE")
-    print("=" * 52)
     print(f"Repeticoes (ciclos abre/fecha): {cycles.repetitions}")
     print(f"Abertura maxima:  {openings_rel.max():.3f} rel")
     print(f"Desvio lateral:   min {lateral_rel.min():+.3f} / max {lateral_rel.max():+.3f} rel")
@@ -258,7 +273,8 @@ def main() -> None:
     p.add_argument("--ref-mm", type=float, default=None,
                    help="distancia real (mm) entre os cantos externos dos olhos")
     p.add_argument("--calib-auto", action="store_true", default=True,
-                   help="calibra a faixa pelos percentis do proprio video (padrao: ligado)")
+                   help="calibra a faixa pelos percentis do proprio video, so com frames "
+                   "validos (padrao: ligado)")
     p.add_argument("--no-calib-auto", dest="calib_auto", action="store_false",
                    help="desliga a calibracao automatica (usa faixa dinamica min/max)")
     p.add_argument("--save-video", action="store_true",

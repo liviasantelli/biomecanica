@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections import Counter
 from datetime import datetime
 
 import numpy as np
@@ -62,21 +63,46 @@ def export_session(
         use_mm=use_mm,
     )
 
-    opening = np.array([s.opening_filtered for s in recorder.samples])
-    lateral = np.array([s.lateral_filtered for s in recorder.samples])
+    # So os frames validos entram nas estatisticas de abertura/desvio: "*_filtered"
+    # e None para frames invalidos (nao inventamos uma medicao 0.0 para eles).
+    opening = np.array(
+        [s.opening_filtered for s in recorder.samples if s.opening_filtered is not None]
+    )
+    lateral = np.array(
+        [s.lateral_filtered for s in recorder.samples if s.lateral_filtered is not None]
+    )
     rep = cycles.repeatability()
+
+    total_frames = len(recorder.samples)
+    frames_com_face = sum(1 for s in recorder.samples if s.face_detected)
+    frames_validos = sum(1 for s in recorder.samples if s.frame_valid)
+    percentual_valido = (100.0 * frames_validos / total_frames) if total_frames else 0.0
+    avisos_qualidade = dict(
+        Counter(s.quality_warning for s in recorder.samples if s.quality_warning)
+    )
 
     resumo = {
         "session_id": session_id,
-        "n_amostras": len(recorder.samples),
+        "total_frames": total_frames,
+        "frames_com_face": frames_com_face,
+        "frames_validos": frames_validos,
+        "percentual_valido": round(percentual_valido, 1),
+        "avisos_qualidade": avisos_qualidade,
+        "calibrado": cycles.is_calibrated,
         "repeticoes": cycles.repetitions,
-        "abertura_minima": float(opening.min()),
-        "abertura_maxima": float(opening.max()),
-        "desvio_lateral_maximo_abs": float(np.abs(lateral).max()),
-        "desvio_lateral_medio_abs": float(np.abs(lateral).mean()),
+        "abertura_minima": float(opening.min()) if len(opening) else None,
+        "abertura_maxima": float(opening.max()) if len(opening) else None,
+        "desvio_lateral_maximo_abs": float(np.abs(lateral).max()) if len(lateral) else None,
+        "desvio_lateral_medio_abs": float(np.abs(lateral).mean()) if len(lateral) else None,
         "repetibilidade": rep,
         "aviso": DISCLAIMER,
     }
+    if not cycles.is_calibrated:
+        resumo["aviso_calibracao"] = (
+            "Sessao NAO calibrada. A contagem de repeticoes (se houver) usa uma "
+            "faixa dinamica de fallback (min/max observados), menos confiavel "
+            "que os limiares de uma calibracao guiada (tecle C)."
+        )
     resumo_path = os.path.join(session_dir, "resumo.json")
     with open(resumo_path, "w", encoding="utf-8") as f:
         json.dump(resumo, f, ensure_ascii=False, indent=2)

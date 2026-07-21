@@ -27,14 +27,9 @@ from .exporter import export_session, make_session_id
 from .feedback import biofeedback_messages
 from .filters import EMAFilter
 from .landmarks import FaceMeshDetector
-from .metrics import (
-    CycleDetector,
-    MovementState,
-    compute_frame_metrics,
-    lateral_direction,
-)
+from .metrics import CycleDetector, MovementState
 from .overlay import C_ALERTA, C_OK, C_REC, C_TEXTO, draw_landmarks, draw_opening_bar, draw_panel
-from .quality import FrameQuality, assess_quality
+from .pipeline import process_frame
 from .recorder import Sample, SessionRecorder
 from .video_recorder import VideoRecorder
 
@@ -99,51 +94,44 @@ class MandibularApp:
                 self._last_ts_ms = ts_ms
                 face = self.detector.process(frame, ts_ms)
 
-                quality = assess_quality(face, self._prev_nasion, self.cfg.quality)
+                fr = process_frame(
+                    face,
+                    self.cfg.reference_distance_mm,
+                    self.cfg.flip_horizontal,
+                    self.cfg.quality,
+                    self.filt_opening,
+                    self.filt_lateral,
+                    self.filt_face_width,
+                    prev_nasion=self._prev_nasion,
+                )
                 self._prev_nasion = face.point(Landmark.NASION) if face is not None else None
-                frame_valid = quality.quality == FrameQuality.VALIDA
-
-                m = compute_frame_metrics(face, self.cfg.reference_distance_mm) if face is not None else None
 
                 if face is not None:
                     draw_landmarks(frame, face)
 
-                if frame_valid and m is not None:
-                    opening_filt = self.filt_opening.update(m.opening_rel)
-                    lateral_filt = self.filt_lateral.update(m.lateral_rel)
-                    self.filt_face_width.update(m.face_width_px)
-                else:
-                    opening_filt = self.filt_opening.value or 0.0
-                    lateral_filt = self.filt_lateral.value or 0.0
-
-                direction = (
-                    lateral_direction(lateral_filt, self.cfg.flip_horizontal)
-                    if frame_valid
-                    else "centro"
-                )
-
-                if self.calib.active and frame_valid:
-                    result = self.calib.update(opening_filt, now)
+                if self.calib.active and fr.frame_valid:
+                    result = self.calib.update(fr.opening_filtered, now)
                     if result is not None:
                         if result.valid:
                             self.cycles.calibrate(result.closed, result.opened)
                         self.last_status = result.message
 
-                if not self.calib.active and frame_valid:
-                    self.cycles.update(opening_filt, t)
+                if not self.calib.active and fr.frame_valid:
+                    self.cycles.update(fr.opening_filtered, t)
 
                 feedback = (
                     []
                     if self.calib.active
-                    else biofeedback_messages(opening_filt, direction, self.cycles, quality)
+                    else biofeedback_messages(fr.opening_display, fr.direction, self.cycles, fr.quality)
                 )
 
                 if face is not None:
-                    draw_opening_bar(frame, opening_filt, self.cycles)
-                self._draw_hud(frame, m, quality, direction, feedback, now)
+                    draw_opening_bar(frame, fr.opening_display, self.cycles)
+                self._draw_hud(frame, fr, feedback, now)
 
                 if self.recording:
                     self._ensure_session()
+                    m = fr.metrics
                     self.recorder.add(
                         Sample(
                             session_id=self.session_id,
@@ -151,19 +139,19 @@ class MandibularApp:
                             timestamp=datetime.now().isoformat(timespec="milliseconds"),
                             time_s=t,
                             face_detected=face is not None,
-                            frame_valid=frame_valid,
-                            opening_raw=m.opening_px if m is not None else 0.0,
-                            opening_rel=m.opening_rel if m is not None else 0.0,
-                            opening_filtered=opening_filt,
-                            opening_mm=(m.opening_mm if (m is not None and frame_valid) else None),
-                            lateral_raw=m.lateral_px if m is not None else 0.0,
-                            lateral_rel=m.lateral_rel if m is not None else 0.0,
-                            lateral_filtered=lateral_filt,
-                            lateral_mm=(m.lateral_mm if (m is not None and frame_valid) else None),
-                            direction=direction,
+                            frame_valid=fr.frame_valid,
+                            opening_raw=(m.opening_px if m is not None else None),
+                            opening_rel=(m.opening_rel if m is not None else None),
+                            opening_filtered=fr.opening_filtered,
+                            opening_mm=(m.opening_mm if (m is not None and fr.frame_valid) else None),
+                            lateral_raw=(m.lateral_px if m is not None else None),
+                            lateral_rel=(m.lateral_rel if m is not None else None),
+                            lateral_filtered=fr.lateral_filtered,
+                            lateral_mm=(m.lateral_mm if (m is not None and fr.frame_valid) else None),
+                            direction=fr.direction,
                             cycle_state=self.cycles.state,
                             repetitions=self.cycles.repetitions,
-                            quality_warning=quality.message,
+                            quality_warning=fr.quality.message,
                         )
                     )
 
@@ -201,7 +189,8 @@ class MandibularApp:
                 self.video_writer = None
 
     # -- HUD ------------------------------------------------------------
-    def _draw_hud(self, frame, m, quality, direction: str, feedback: list[str], now: float) -> None:
+    def _draw_hud(self, frame, fr, feedback: list[str], now: float) -> None:
+        m, quality, direction = fr.metrics, fr.quality, fr.direction
         state = self.cycles.state
         state_color = {
             MovementState.FECHADO: C_TEXTO,
@@ -221,11 +210,28 @@ class MandibularApp:
             else:
                 lines.append((f"Abertura: {m.opening_rel:.3f} (rel. larg. facial)", C_TEXTO))
                 lines.append((f"Desvio lateral: {m.lateral_rel:+.3f}  [{direction}]", C_TEXTO))
+            if not fr.frame_valid:
+                lines.append((
+                    "Frame invalido - exibindo ultimo valor valido (NAO e nova medicao)",
+                    C_ALERTA,
+                ))
+            # Depuracao: razao de tamanho facial atual, limite minimo e motivo exato.
+            if quality.ratio is not None:
+                lines.append((
+                    f"Razao facial: {quality.ratio:.3f}  (min {quality.min_ratio:.2f} / max {quality.max_ratio:.2f})",
+                    C_TEXTO,
+                ))
             if quality.message:
-                lines.append((quality.message, C_ALERTA))
+                lines.append((f"{quality.message}", C_ALERTA))
 
         lines.append((f"Estado: {state.value.upper()}", state_color))
-        lines.append((f"Repeticoes: {self.cycles.repetitions}", C_TEXTO))
+        if self.cycles.is_calibrated:
+            lines.append((f"Repeticoes: {self.cycles.repetitions}", C_TEXTO))
+        else:
+            lines.append((
+                f"Repeticoes (NAO calibrado, faixa dinamica): {self.cycles.repetitions}",
+                C_ALERTA,
+            ))
         lines.append((
             "Calibrado: sim" if self.cycles.is_calibrated else "Calibrado: nao (tecle C)",
             C_OK if self.cycles.is_calibrated else C_ALERTA,

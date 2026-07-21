@@ -38,20 +38,30 @@ CSV_COLUMNS = [
 
 @dataclass
 class Sample:
-    """Uma amostra temporal do movimento (item 12 do escopo funcional)."""
+    """
+    Uma amostra temporal do movimento (item 12 do escopo funcional).
+
+    Os campos "*_filtered" sao None quando frame_valid=False: um frame
+    invalido nao produz uma nova medicao filtrada (o filtro fica congelado),
+    entao gravar 0.0 seria fabricar um dado que nunca foi medido. Os campos
+    "*_raw"/"*_rel" tambem sao None quando face_detected=False (sem face nao
+    ha o que medir); quando ha face mas o frame e invalido por outro motivo
+    (rosto longe, inclinado etc.), o valor bruto calculado e preservado para
+    auditoria, mesmo que a medicao nao seja considerada confiavel.
+    """
     session_id: str
     frame: int
     timestamp: str
     time_s: float
     face_detected: bool
     frame_valid: bool
-    opening_raw: float
-    opening_rel: float
-    opening_filtered: float
+    opening_raw: float | None
+    opening_rel: float | None
+    opening_filtered: float | None
     opening_mm: float | None
-    lateral_raw: float
-    lateral_rel: float
-    lateral_filtered: float
+    lateral_raw: float | None
+    lateral_rel: float | None
+    lateral_filtered: float | None
     lateral_mm: float | None
     direction: str
     cycle_state: MovementState
@@ -59,6 +69,9 @@ class Sample:
     quality_warning: str | None
 
     def to_row(self) -> list:
+        def fmt(v: float | None, decimals: int) -> str:
+            return "" if v is None else f"{v:.{decimals}f}"
+
         return [
             self.session_id,
             self.frame,
@@ -66,14 +79,14 @@ class Sample:
             f"{self.time_s:.4f}",
             int(self.face_detected),
             int(self.frame_valid),
-            f"{self.opening_raw:.4f}",
-            f"{self.opening_rel:.6f}",
-            f"{self.opening_filtered:.6f}",
-            "" if self.opening_mm is None else f"{self.opening_mm:.3f}",
-            f"{self.lateral_raw:.4f}",
-            f"{self.lateral_rel:.6f}",
-            f"{self.lateral_filtered:.6f}",
-            "" if self.lateral_mm is None else f"{self.lateral_mm:.3f}",
+            fmt(self.opening_raw, 4),
+            fmt(self.opening_rel, 6),
+            fmt(self.opening_filtered, 6),
+            fmt(self.opening_mm, 3),
+            fmt(self.lateral_raw, 4),
+            fmt(self.lateral_rel, 6),
+            fmt(self.lateral_filtered, 6),
+            fmt(self.lateral_mm, 3),
             self.direction,
             self.cycle_state.value,
             self.repetitions,
