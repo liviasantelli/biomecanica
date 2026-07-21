@@ -62,6 +62,29 @@ class DetectionConfig:
 
 
 @dataclass
+class FilterConfig:
+    """
+    Parametros do filtro EMA (media movel exponencial) aplicado aos sinais.
+
+    Alpha alto = segue o sinal mais de perto (menos atraso, menos suavizacao);
+    alpha baixo = mais suave, mais atraso. Valores por volta de 0.4-0.6 reduzem
+    ruido de deteccao sem introduzir atraso perceptivel a ~30 fps.
+    """
+    alpha_opening: float = 0.5
+    alpha_lateral: float = 0.5
+    alpha_face_width: float = 0.3
+
+
+@dataclass
+class QualityConfig:
+    """Limiares para classificar a qualidade do frame e orientar o usuario."""
+    min_face_width_fraction: float = 0.15   # face_width_px / diagonal_imagem
+    max_face_width_fraction: float = 0.9
+    max_roll_deg: float = 30.0              # inclinacao maxima da cabeca (roll)
+    max_global_jump_fraction: float = 0.25  # deslocamento do nasion entre frames (fracao da largura facial)
+
+
+@dataclass
 class CycleConfig:
     """
     Parametros da deteccao de ciclos de abertura/fechamento.
@@ -88,6 +111,8 @@ class AppConfig:
 
     detection: DetectionConfig = field(default_factory=DetectionConfig)
     cycle: CycleConfig = field(default_factory=CycleConfig)
+    filter: FilterConfig = field(default_factory=FilterConfig)
+    quality: QualityConfig = field(default_factory=QualityConfig)
 
     # Calibracao opcional para converter unidades relativas em milimetros.
     # Se informado, e a distancia real (mm) entre os cantos externos dos olhos.
